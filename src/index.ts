@@ -162,10 +162,12 @@ export class Room {
           // ── Scene mutations (editors only) ──
           case "add-item": {
             const item = msg.item as SceneItem;
-            item.id = this.scene.nextId++;
+            // Keep client-assigned ID, but track max for nextId
+            if (item.id >= this.scene.nextId) this.scene.nextId = item.id + 1;
             this.scene.items.push(item);
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }));
+            // Send to everyone EXCEPT the sender (they already have it)
+            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }), peerId);
             break;
           }
 
@@ -189,21 +191,21 @@ export class Room {
               (t) => t.fromId !== msg.id && t.toId !== msg.id
             );
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "remove-item", id: msg.id, by: peerId }));
+            this.broadcast(JSON.stringify({ type: "remove-item", id: msg.id, by: peerId }), peerId);
             break;
           }
 
           case "add-thread": {
             this.scene.threads.push(msg.thread as ThreadData);
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "add-thread", thread: msg.thread, by: peerId }));
+            this.broadcast(JSON.stringify({ type: "add-thread", thread: msg.thread, by: peerId }), peerId);
             break;
           }
 
           case "clear-threads": {
             this.scene.threads = [];
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "clear-threads", by: peerId }));
+            this.broadcast(JSON.stringify({ type: "clear-threads", by: peerId }), peerId);
             break;
           }
 
