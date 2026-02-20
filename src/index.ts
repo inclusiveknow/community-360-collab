@@ -71,6 +71,8 @@ export class Room {
   peers: Map<string, Peer> = new Map();
   scene: RoomState = { items: [], threads: [], envUrl: "", nextId: 1 };
   peerIdCounter = 0;
+  // Chunked upload buffers: uploadId → { meta, chunks, peerId }
+  chunkBuffers: Map<string, { meta: SceneItem; chunks: string[]; peerId: string }> = new Map();
 
   constructor(state: DurableObjectState) {
     this.state = state;
@@ -211,6 +213,52 @@ export class Room {
             this.scene.envUrl = msg.url;
             await this.saveScene();
             this.broadcast(JSON.stringify({ type: "set-env", url: msg.url, by: peerId }), peerId);
+            break;
+          }
+
+          // ── Chunked media upload ──────────────────────────────────────
+          // Clients split large base64 blobs into 256KB pieces to stay under
+          // Cloudflare's 1MB WebSocket message limit. Server buffers here,
+          // then broadcasts the assembled add-item once all chunks arrive.
+          case "media-chunk-start": {
+            this.chunkBuffers.set(msg.uploadId, {
+              meta: msg.itemMeta as SceneItem,
+              chunks: [],
+              peerId,
+            });
+            break;
+          }
+
+          case "media-chunk": {
+            const buf = this.chunkBuffers.get(msg.uploadId);
+            if (buf) buf.chunks[msg.index] = msg.data as string;
+            break;
+          }
+
+          case "media-chunk-end": {
+            const buf = this.chunkBuffers.get(msg.uploadId);
+            if (!buf) break;
+            this.chunkBuffers.delete(msg.uploadId);
+
+            // Verify we have all chunks (no gaps)
+            const expectedChunks = msg.totalChunks as number;
+            if (buf.chunks.length !== expectedChunks || buf.chunks.some(c => c === undefined)) {
+              console.error("Chunked upload incomplete:", msg.uploadId,
+                "got", buf.chunks.filter(Boolean).length, "of", expectedChunks);
+              // Don't broadcast — client will notice item didn't arrive via sync
+              break;
+            }
+
+            // Assemble and store
+            const fullSrc = buf.chunks.join("");
+            const item = buf.meta;
+            item.src = fullSrc;
+            item.id = this.scene.nextId++;
+            this.scene.items.push(item);
+            await this.saveScene();
+
+            // Broadcast to all peers (including sender — they need the server ID)
+            this.broadcast(JSON.stringify({ type: "add-item", item, by: buf.peerId }));
             break;
           }
 
