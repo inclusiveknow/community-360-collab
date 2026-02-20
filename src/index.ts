@@ -236,6 +236,14 @@ export class Room {
               uploadId: msg.uploadId,
               serverId: meta.id,
             }));
+
+            // Broadcast placeholder add-item to all OTHER peers so they have
+            // the item in their scene before chunks start arriving.
+            // src is "" — will be filled in as chunks arrive and are reassembled.
+            this.broadcast(
+              JSON.stringify({ type: "add-item", item: meta, by: peerId }),
+              peerId
+            );
             break;
           }
 
