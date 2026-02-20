@@ -1,10 +1,23 @@
-// Community 360° Builder — Collaboration Server v3
-// Cloudflare Worker + Durable Object
-// Fix: Uses ctx.acceptWebSocket() (hibernation API) so WebSocket
-// connections survive DO hibernation and don't get silently dropped.
+// ═══════════════════════════════════════════════════════════
+// Community 360° Builder — Collaboration Server
+// Cloudflare Worker + Durable Object (PartyServer pattern)
+// ═══════════════════════════════════════════════════════════
+//
+// Deploy: npx wrangler deploy
+// Each "room" is a Durable Object that holds the shared scene.
+// Clients connect via WebSocket and sync items/threads in real time.
 
 interface Env {
   ROOM: DurableObjectNamespace;
+}
+
+// ─── Types ───
+interface Peer {
+  ws: WebSocket;
+  name: string;
+  role: "editor" | "viewer";
+  color: string;
+  joinedAt: number;
 }
 
 interface SceneItem {
@@ -12,283 +25,342 @@ interface SceneItem {
   type: string;
   name: string;
   src: string;
-  lon: number; lat: number; depth: number; scale: number; opacity: number;
-  rx: number; ry: number; rz: number;
-  bb: boolean; loop: boolean; vis: boolean;
-  glow: boolean; glowColor: string; pulse: boolean; float: boolean;
-  interact: string; meta: string; isolated: boolean;
-  txtSize?: number; txtColor?: string; txtBg?: string; txtBgOp?: number; txtTransp?: boolean;
+  lon: number;
+  lat: number;
+  depth: number;
+  scale: number;
+  opacity: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  bb: boolean;
+  loop: boolean;
+  vis: boolean;
+  glow: boolean;
+  glowColor: string;
+  interact: string;
+  meta: string;
+  isolated: boolean;
   [key: string]: any;
 }
 
-interface ThreadData { fromId: number; toId: number; color: string; width: number; glow: number; }
+interface ThreadData {
+  fromId: number;
+  toId: number;
+  color: string;
+  width: number;
+  glow: number;
+}
 
-interface RoomState { items: SceneItem[]; threads: ThreadData[]; envUrl: string; nextId: number; }
+interface RoomState {
+  items: SceneItem[];
+  threads: ThreadData[];
+  envUrl: string;
+  nextId: number;
+}
 
-interface PeerMeta { name: string; role: "editor" | "viewer"; color: string; joinedAt: number; }
+// Peer colors — visually distinct, accessible
+const PEER_COLORS = [
+  "#4ecdc4", "#a78bfa", "#f472b6", "#fb923c",
+  "#4ade80", "#60a5fa", "#facc15", "#f87171",
+];
 
-const PEER_COLORS = ["#4ecdc4","#a78bfa","#f472b6","#fb923c","#4ade80","#60a5fa","#facc15","#f87171"];
-
+// ─── Durable Object: Room ───
 export class Room {
   state: DurableObjectState;
+  peers: Map<string, Peer> = new Map();
   scene: RoomState = { items: [], threads: [], envUrl: "", nextId: 1 };
   peerIdCounter = 0;
 
   constructor(state: DurableObjectState) {
     this.state = state;
+    // Load persisted scene on wake
     state.blockConcurrencyWhile(async () => {
       const saved = await state.storage.get<RoomState>("scene");
       if (saved) this.scene = saved;
-      const ctr = await state.storage.get<number>("peerIdCounter");
-      if (ctr) this.peerIdCounter = ctr;
     });
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // ── HTTP: Get room info ──
+    if (request.method === "GET" && url.pathname.endsWith("/info")) {
+      return Response.json({
+        peers: Array.from(this.peers.values()).map((p) => ({
+          name: p.name,
+          role: p.role,
+          color: p.color,
+        })),
+        itemCount: this.scene.items.length,
+        threadCount: this.scene.threads.length,
+      });
+    }
+
+    // ── WebSocket upgrade ──
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected WebSocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+
+    // Parse query params for join info
+    const name = url.searchParams.get("name") || "Anonymous";
+    const role = url.searchParams.get("role") === "viewer" ? "viewer" : "editor";
+    const peerId = `p${++this.peerIdCounter}`;
+    const color = PEER_COLORS[this.peerIdCounter % PEER_COLORS.length];
+
+    const peer: Peer = { ws: server, name, role, color, joinedAt: Date.now() };
+    this.peers.set(peerId, peer);
+
+    server.accept();
+
+    // Send initial state to new peer
+    server.send(
+      JSON.stringify({
+        type: "init",
+        peerId,
+        role,
+        color,
+        scene: this.scene,
+        peers: Array.from(this.peers.entries()).map(([id, p]) => ({
+          id,
+          name: p.name,
+          role: p.role,
+          color: p.color,
+        })),
+      })
+    );
+
+    // Announce join to others
+    this.broadcast(
+      JSON.stringify({
+        type: "peer-join",
+        peerId,
+        name,
+        role,
+        color,
+      }),
+      peerId
+    );
+
+    // ── Message handler ──
+    server.addEventListener("message", async (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+        const sender = this.peers.get(peerId);
+        if (!sender) return;
+
+        // Viewers can only send cursor/camera updates
+        if (sender.role === "viewer" && !["cursor", "camera"].includes(msg.type)) {
+          server.send(JSON.stringify({ type: "error", message: "Viewers cannot edit" }));
+          return;
+        }
+
+        switch (msg.type) {
+          // ── Scene mutations (editors only) ──
+          case "add-item": {
+            const item = msg.item as SceneItem;
+            item.id = this.scene.nextId++;
+            this.scene.items.push(item);
+            await this.saveScene();
+            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }));
+            break;
+          }
+
+          case "update-item": {
+            const idx = this.scene.items.findIndex((i) => i.id === msg.id);
+            if (idx >= 0) {
+              Object.assign(this.scene.items[idx], msg.changes);
+              await this.saveScene();
+              this.broadcast(
+                JSON.stringify({ type: "update-item", id: msg.id, changes: msg.changes, by: peerId }),
+                peerId // don't echo back to sender
+              );
+            }
+            break;
+          }
+
+          case "remove-item": {
+            this.scene.items = this.scene.items.filter((i) => i.id !== msg.id);
+            // Also remove threads referencing this item
+            this.scene.threads = this.scene.threads.filter(
+              (t) => t.fromId !== msg.id && t.toId !== msg.id
+            );
+            await this.saveScene();
+            this.broadcast(JSON.stringify({ type: "remove-item", id: msg.id, by: peerId }));
+            break;
+          }
+
+          case "add-thread": {
+            this.scene.threads.push(msg.thread as ThreadData);
+            await this.saveScene();
+            this.broadcast(JSON.stringify({ type: "add-thread", thread: msg.thread, by: peerId }));
+            break;
+          }
+
+          case "clear-threads": {
+            this.scene.threads = [];
+            await this.saveScene();
+            this.broadcast(JSON.stringify({ type: "clear-threads", by: peerId }));
+            break;
+          }
+
+          case "set-env": {
+            this.scene.envUrl = msg.url;
+            await this.saveScene();
+            this.broadcast(JSON.stringify({ type: "set-env", url: msg.url, by: peerId }), peerId);
+            break;
+          }
+
+          // ── Isolation intent — relay only, no persistence ──
+          // Each peer runs MediaPipe locally on their own copy of the media.
+          case "isolate-item": {
+            this.broadcast(
+              JSON.stringify({ type: "isolate-item", id: msg.id, isolated: msg.isolated, peerId }),
+              peerId
+            );
+            break;
+          }
+
+          // ── Selection presence — relay only ──
+          case "sel-item": {
+            this.broadcast(
+              JSON.stringify({ type: "sel-item", peerId, id: msg.id ?? null }),
+              peerId
+            );
+            break;
+          }
+
+          // ── Playback mode sync — relay only ──
+          case "set-playback-mode": {
+            this.broadcast(
+              JSON.stringify({ type: "set-playback-mode", mode: msg.mode, by: peerId }),
+              peerId
+            );
+            break;
+          }
+
+          // ── Play/pause sync (host mode) — relay only ──
+          case "play-item": {
+            this.broadcast(
+              JSON.stringify({ type: "play-item", id: msg.id, currentTime: msg.currentTime ?? null, by: peerId }),
+              peerId
+            );
+            break;
+          }
+
+          case "pause-item": {
+            this.broadcast(
+              JSON.stringify({ type: "pause-item", id: msg.id, by: peerId }),
+              peerId
+            );
+            break;
+          }
+
+          // ── Presence (everyone) ──
+          case "cursor": {
+            this.broadcast(
+              JSON.stringify({
+                type: "cursor", peerId,
+                screenX: msg.screenX, screenY: msg.screenY,
+                lon: msg.lon, lat: msg.lat,
+              }),
+              peerId
+            );
+            break;
+          }
+
+          case "camera": {
+            this.broadcast(
+              JSON.stringify({ type: "camera", peerId, lon: msg.lon, lat: msg.lat, fov: msg.fov }),
+              peerId
+            );
+            break;
+          }
+        }
+      } catch (e) {
+        console.error("Message error:", e);
+      }
+    });
+
+    // ── Disconnect handler ──
+    server.addEventListener("close", () => {
+      this.peers.delete(peerId);
+      this.broadcast(JSON.stringify({ type: "peer-leave", peerId }));
+    });
+
+    server.addEventListener("error", () => {
+      this.peers.delete(peerId);
+      this.broadcast(JSON.stringify({ type: "peer-leave", peerId }));
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  broadcast(message: string, exclude?: string) {
+    for (const [id, peer] of this.peers) {
+      if (id === exclude) continue;
+      try {
+        peer.ws.send(message);
+      } catch {
+        // Dead connection, clean up
+        this.peers.delete(id);
+      }
+    }
   }
 
   async saveScene() {
     await this.state.storage.put("scene", this.scene);
   }
-
-  async deferSave() {
-    try {
-      await this.state.storage.setAlarm(Date.now() + 600);
-    } catch {
-      await this.state.storage.put("scene", this.scene);
-    }
-  }
-
-  async alarm() {
-    await this.state.storage.put("scene", this.scene);
-  }
-
-  // ── Helper: get peer metadata from WebSocket tags ──
-  getPeerMeta(ws: WebSocket): PeerMeta | null {
-    try {
-      const tags = this.state.getTags(ws);
-      const metaTag = tags.find((t: string) => t.startsWith("meta:"));
-      if (!metaTag) return null;
-      return JSON.parse(metaTag.slice(5));
-    } catch { return null; }
-  }
-
-  getPeerId(ws: WebSocket): string | null {
-    try {
-      const tags = this.state.getTags(ws);
-      const idTag = tags.find((t: string) => t.startsWith("id:"));
-      return idTag ? idTag.slice(3) : null;
-    } catch { return null; }
-  }
-
-  broadcast(message: string, excludeId?: string) {
-    for (const ws of this.state.getWebSockets()) {
-      const id = this.getPeerId(ws);
-      if (id === excludeId) continue;
-      try { ws.send(message); } catch { /* hibernation API handles cleanup */ }
-    }
-  }
-
-  broadcastPeerList() {
-    const peers = this.state.getWebSockets().map((ws: WebSocket) => {
-      const id = this.getPeerId(ws);
-      const meta = this.getPeerMeta(ws);
-      return { id, ...meta };
-    }).filter(p => p.id && p.name);
-    return peers;
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Upgrade",
-    };
-
-    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-
-    if (request.method === "GET" && url.pathname.endsWith("/info")) {
-      const peers = this.broadcastPeerList();
-      return Response.json({ peers, itemCount: this.scene.items.length }, { headers: corsHeaders });
-    }
-
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("Expected WebSocket", { status: 426 });
-    }
-
-    const name = url.searchParams.get("name") || "Anonymous";
-    const role = url.searchParams.get("role") === "viewer" ? "viewer" : "editor";
-    const peerId = `p${++this.peerIdCounter}`;
-    await this.state.storage.put("peerIdCounter", this.peerIdCounter);
-    const color = PEER_COLORS[this.peerIdCounter % PEER_COLORS.length];
-    const meta: PeerMeta = { name, role, color, joinedAt: Date.now() };
-
-    // Use hibernation API — survives DO sleep, no silent drops
-    const pair = new WebSocketPair();
-    const [client, server] = [pair[0], pair[1]];
-    this.state.acceptWebSocket(server, [`id:${peerId}`, `meta:${JSON.stringify(meta)}`]);
-
-    // Send full scene state to new peer
-    server.send(JSON.stringify({
-      type: "init", peerId, role, color,
-      scene: this.scene,
-      peers: this.broadcastPeerList(),
-    }));
-
-    // Announce join to others
-    this.broadcast(JSON.stringify({ type: "peer-join", peerId, name, role, color }), peerId);
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  // ── Hibernation API message handler ──
-  async webSocketMessage(ws: WebSocket, message: string) {
-    try {
-      const msg = JSON.parse(message);
-      const peerId = this.getPeerId(ws);
-      const meta = this.getPeerMeta(ws);
-      if (!peerId || !meta) return;
-
-      // Viewers can only send presence
-      if (meta.role === "viewer" && !["cursor", "camera"].includes(msg.type)) {
-        ws.send(JSON.stringify({ type: "error", message: "Viewers cannot edit" }));
-        return;
-      }
-
-      switch (msg.type) {
-
-        case "add-item": {
-          const item = msg.item as SceneItem;
-          // Trust client ID — just keep nextId ahead
-          if (item.id >= this.scene.nextId) this.scene.nextId = item.id + 1;
-          // Handle collision (two editors add simultaneously)
-          const exists = this.scene.items.some(i => i.id === item.id);
-          if (exists) {
-            const newId = this.scene.nextId++;
-            ws.send(JSON.stringify({ type: "id-remap", oldId: item.id, newId }));
-            item.id = newId;
-          }
-          this.scene.items.push(item);
-          await this.saveScene();
-          // Echo back to ALL including sender so sender confirms server ID
-          this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }));
-          break;
-        }
-
-        case "update-item": {
-          const idx = this.scene.items.findIndex(i => i.id === msg.id);
-          if (idx >= 0) {
-            Object.assign(this.scene.items[idx], msg.changes);
-            await this.deferSave();
-            this.broadcast(
-              JSON.stringify({ type: "update-item", id: msg.id, changes: msg.changes, by: peerId }),
-              peerId
-            );
-          }
-          break;
-        }
-
-        case "remove-item": {
-          this.scene.items = this.scene.items.filter(i => i.id !== msg.id);
-          this.scene.threads = this.scene.threads.filter(t => t.fromId !== msg.id && t.toId !== msg.id);
-          await this.saveScene();
-          this.broadcast(JSON.stringify({ type: "remove-item", id: msg.id, by: peerId }));
-          break;
-        }
-
-        case "add-thread": {
-          this.scene.threads.push(msg.thread);
-          await this.saveScene();
-          this.broadcast(JSON.stringify({ type: "add-thread", thread: msg.thread, by: peerId }));
-          break;
-        }
-
-        case "clear-threads": {
-          this.scene.threads = [];
-          await this.saveScene();
-          this.broadcast(JSON.stringify({ type: "clear-threads", by: peerId }));
-          break;
-        }
-
-        case "set-env": {
-          this.scene.envUrl = msg.url;
-          await this.saveScene();
-          this.broadcast(JSON.stringify({ type: "set-env", url: msg.url, by: peerId }), peerId);
-          break;
-        }
-
-        case "cursor":
-          this.broadcast(JSON.stringify({ type: "cursor", peerId, screenX: msg.screenX, screenY: msg.screenY, lon: msg.lon, lat: msg.lat }), peerId);
-          break;
-
-        case "sel-item":
-          this.broadcast(JSON.stringify({ type: "sel-item", peerId, id: msg.id ?? null }), peerId);
-          break;
-
-        case "camera":
-          this.broadcast(JSON.stringify({ type: "camera", peerId, lon: msg.lon, lat: msg.lat }), peerId);
-          break;
-
-        case "play-item":
-          this.broadcast(JSON.stringify({ type: "play-item", id: msg.id, currentTime: msg.currentTime, by: peerId }), peerId);
-          break;
-
-        case "pause-item":
-          this.broadcast(JSON.stringify({ type: "pause-item", id: msg.id, by: peerId }), peerId);
-          break;
-
-        case "set-playback-mode":
-          if (meta.role === "editor" && (msg.mode === "independent" || msg.mode === "host")) {
-            this.broadcast(JSON.stringify({ type: "set-playback-mode", mode: msg.mode, by: peerId }), peerId);
-          }
-          break;
-      }
-    } catch (e) {
-      console.error("webSocketMessage error:", e);
-    }
-  }
-
-  async webSocketClose(ws: WebSocket) {
-    const peerId = this.getPeerId(ws);
-    if (peerId) this.broadcast(JSON.stringify({ type: "peer-leave", peerId }), peerId);
-  }
-
-  async webSocketError(ws: WebSocket) {
-    const peerId = this.getPeerId(ws);
-    if (peerId) this.broadcast(JSON.stringify({ type: "peer-leave", peerId }), peerId);
-  }
 }
 
+// ─── Worker entry point ───
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname;
+
+    // CORS headers for cross-origin access
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Upgrade",
     };
 
-    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
 
-    const roomMatch = url.pathname.match(/^\/room\/([a-zA-Z0-9_-]+)(\/info)?$/);
+    // ── Route: /room/:id — WebSocket or info ──
+    const roomMatch = path.match(/^\/room\/([a-zA-Z0-9_-]+)(\/info)?$/);
     if (roomMatch) {
       const roomId = roomMatch[1];
       const id = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(id);
       const response = await stub.fetch(request);
+
+      // Add CORS to non-WebSocket responses
       if (!request.headers.get("Upgrade")) {
-        const newRes = new Response(response.body, response);
-        for (const [k, v] of Object.entries(corsHeaders)) newRes.headers.set(k, v);
-        return newRes;
+        const newResponse = new Response(response.body, response);
+        for (const [k, v] of Object.entries(corsHeaders)) {
+          newResponse.headers.set(k, v);
+        }
+        return newResponse;
       }
       return response;
     }
 
-    if (url.pathname === "/new" && request.method === "POST") {
-      const roomId = crypto.randomUUID().split("-")[0];
+    // ── Route: /new — Create a new room, return its ID ──
+    if (path === "/new" && request.method === "POST") {
+      const roomId = crypto.randomUUID().split("-")[0]; // Short 8-char ID
       return Response.json({ roomId, url: `/room/${roomId}` }, { headers: corsHeaders });
     }
 
+    // ── Default: landing page ──
     return new Response(
-      "Community 360° Builder — Collab Server v3\nPOST /new\nWS /room/:id\nGET /room/:id/info",
+      `Community 360° Builder — Collaboration Server\n\nPOST /new → create room\nWS /room/:id → join room\nGET /room/:id/info → room info`,
       { headers: { ...corsHeaders, "Content-Type": "text/plain" } }
     );
   },
