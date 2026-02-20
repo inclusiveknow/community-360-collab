@@ -103,14 +103,22 @@ export class Room {
     await this.state.storage.put("scene", this.scene);
   }
 
-  // Deferred save — for high-frequency updates (drag/move)
-  // Coalesces rapid writes into one storage op after 500ms of quiet
-  deferSave() {
-    if (this.saveTimer) clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(async () => {
-      this.saveTimer = null;
+  // Deferred save — coalesces rapid writes (drag/move) into one storage op.
+  // Uses state.storage.setAlarm() which is reliable in Durable Objects
+  // (unlike setTimeout which may not fire if the DO hibernates).
+  async deferSave() {
+    try {
+      // Set alarm 600ms out — if called again before it fires, it resets.
+      await this.state.storage.setAlarm(Date.now() + 600);
+    } catch {
+      // Fallback: save immediately if alarms not available
       await this.state.storage.put("scene", this.scene);
-    }, 500);
+    }
+  }
+
+  // Called by Cloudflare when the alarm fires
+  async alarm() {
+    await this.state.storage.put("scene", this.scene);
   }
 
   async fetch(request: Request): Promise<Response> {
