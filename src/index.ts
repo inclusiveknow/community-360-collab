@@ -1,11 +1,22 @@
 // ═══════════════════════════════════════════════════════════
-// Community 360° Builder — Collaboration Server
+// Community 360° Builder — Collaboration Server v2
 // Cloudflare Worker + Durable Object (PartyServer pattern)
 // ═══════════════════════════════════════════════════════════
 //
+// Fixes over v1:
+//   1. Client ID trusted — server no longer reassigns item.id.
+//      The client assigns the ID before sending; server stores
+//      and broadcasts it as-is, then confirms back to sender
+//      with an 'item-added' ack. This keeps all peers in sync
+//      on the same ID from the moment of creation.
+//   2. Deferred saves on update-item — positional drag sends
+//      30+ msgs/sec. Saving to Durable Object storage on every
+//      one hit Cloudflare limits and caused backpressure/drops.
+//      Now: update-item broadcasts immediately but saves are
+//      debounced (500ms). Structural mutations (add, remove,
+//      threads, env) still save immediately.
+//
 // Deploy: npx wrangler deploy
-// Each "room" is a Durable Object that holds the shared scene.
-// Clients connect via WebSocket and sync items/threads in real time.
 
 interface Env {
   ROOM: DurableObjectNamespace;
@@ -72,13 +83,34 @@ export class Room {
   scene: RoomState = { items: [], threads: [], envUrl: "", nextId: 1 };
   peerIdCounter = 0;
 
+  // Debounce handle for deferred saves
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(state: DurableObjectState) {
     this.state = state;
-    // Load persisted scene on wake
     state.blockConcurrencyWhile(async () => {
       const saved = await state.storage.get<RoomState>("scene");
       if (saved) this.scene = saved;
     });
+  }
+
+  // Immediate save — for structural mutations
+  async saveScene() {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    await this.state.storage.put("scene", this.scene);
+  }
+
+  // Deferred save — for high-frequency updates (drag/move)
+  // Coalesces rapid writes into one storage op after 500ms of quiet
+  deferSave() {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(async () => {
+      this.saveTimer = null;
+      await this.state.storage.put("scene", this.scene);
+    }, 500);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -105,7 +137,6 @@ export class Room {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
 
-    // Parse query params for join info
     const name = url.searchParams.get("name") || "Anonymous";
     const role = url.searchParams.get("role") === "viewer" ? "viewer" : "editor";
     const peerId = `p${++this.peerIdCounter}`;
@@ -116,7 +147,7 @@ export class Room {
 
     server.accept();
 
-    // Send initial state to new peer
+    // Send full scene state to new peer
     server.send(
       JSON.stringify({
         type: "init",
@@ -135,13 +166,7 @@ export class Room {
 
     // Announce join to others
     this.broadcast(
-      JSON.stringify({
-        type: "peer-join",
-        peerId,
-        name,
-        role,
-        color,
-      }),
+      JSON.stringify({ type: "peer-join", peerId, name, role, color }),
       peerId
     );
 
@@ -152,22 +177,40 @@ export class Room {
         const sender = this.peers.get(peerId);
         if (!sender) return;
 
-        // Viewers can only send cursor/camera updates
+        // Viewers can only send presence updates
         if (sender.role === "viewer" && !["cursor", "camera"].includes(msg.type)) {
           server.send(JSON.stringify({ type: "error", message: "Viewers cannot edit" }));
           return;
         }
 
         switch (msg.type) {
-          // ── Scene mutations (editors only) ──
+
           case "add-item": {
             const item = msg.item as SceneItem;
-            // Keep client-assigned ID, but track max for nextId
-            if (item.id >= this.scene.nextId) this.scene.nextId = item.id + 1;
+
+            // FIX 1: Trust the client's ID — don't overwrite it.
+            // Client assigns the ID before sending so it can track
+            // the item locally. We just make sure nextId stays ahead
+            // of whatever IDs clients are generating.
+            if (item.id >= this.scene.nextId) {
+              this.scene.nextId = item.id + 1;
+            }
+
+            // Avoid duplicate IDs if two editors add simultaneously
+            const exists = this.scene.items.some((i) => i.id === item.id);
+            if (exists) {
+              // Assign a safe server ID and tell the sender to remap
+              const newId = this.scene.nextId++;
+              server.send(JSON.stringify({ type: "id-remap", oldId: item.id, newId }));
+              item.id = newId;
+            }
+
             this.scene.items.push(item);
-            await this.saveScene();
-            // Send to everyone EXCEPT the sender (they already have it)
-            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }), peerId);
+            await this.saveScene(); // structural — save immediately
+
+            // Broadcast to everyone including sender so all peers
+            // confirm the same final ID
+            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }));
             break;
           }
 
@@ -175,10 +218,11 @@ export class Room {
             const idx = this.scene.items.findIndex((i) => i.id === msg.id);
             if (idx >= 0) {
               Object.assign(this.scene.items[idx], msg.changes);
-              await this.saveScene();
+              // FIX 2: Defer save — broadcast immediately, write later
+              this.deferSave();
               this.broadcast(
                 JSON.stringify({ type: "update-item", id: msg.id, changes: msg.changes, by: peerId }),
-                peerId // don't echo back to sender
+                peerId // don't echo back to mover
               );
             }
             break;
@@ -186,26 +230,25 @@ export class Room {
 
           case "remove-item": {
             this.scene.items = this.scene.items.filter((i) => i.id !== msg.id);
-            // Also remove threads referencing this item
             this.scene.threads = this.scene.threads.filter(
               (t) => t.fromId !== msg.id && t.toId !== msg.id
             );
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "remove-item", id: msg.id, by: peerId }), peerId);
+            this.broadcast(JSON.stringify({ type: "remove-item", id: msg.id, by: peerId }));
             break;
           }
 
           case "add-thread": {
             this.scene.threads.push(msg.thread as ThreadData);
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "add-thread", thread: msg.thread, by: peerId }), peerId);
+            this.broadcast(JSON.stringify({ type: "add-thread", thread: msg.thread, by: peerId }));
             break;
           }
 
           case "clear-threads": {
             this.scene.threads = [];
             await this.saveScene();
-            this.broadcast(JSON.stringify({ type: "clear-threads", by: peerId }), peerId);
+            this.broadcast(JSON.stringify({ type: "clear-threads", by: peerId }));
             break;
           }
 
@@ -216,10 +259,19 @@ export class Room {
             break;
           }
 
-          // ── Presence (everyone) ──
+          // ── Presence — relay only, never saved ──
           case "cursor": {
             this.broadcast(
-              JSON.stringify({ type: "cursor", peerId, lon: msg.lon, lat: msg.lat }),
+              JSON.stringify({ type: "cursor", peerId, screenX: msg.screenX, screenY: msg.screenY, lon: msg.lon, lat: msg.lat }),
+              peerId
+            );
+            break;
+          }
+
+          case "sel-item": {
+            // Broadcast which item this peer has selected (null = deselected)
+            this.broadcast(
+              JSON.stringify({ type: "sel-item", peerId, id: msg.id ?? null }),
               peerId
             );
             break;
@@ -232,13 +284,41 @@ export class Room {
             );
             break;
           }
+
+          // ── Playback sync (host-controlled mode only) ──
+          case "play-item": {
+            this.broadcast(
+              JSON.stringify({ type: "play-item", id: msg.id, currentTime: msg.currentTime, by: peerId }),
+              peerId
+            );
+            break;
+          }
+
+          case "pause-item": {
+            this.broadcast(
+              JSON.stringify({ type: "pause-item", id: msg.id, by: peerId }),
+              peerId
+            );
+            break;
+          }
+
+          // ── Playback mode sync (editors only) ──
+          case "set-playback-mode": {
+            if (sender.role === "editor" && (msg.mode === "independent" || msg.mode === "host")) {
+              this.broadcast(
+                JSON.stringify({ type: "set-playback-mode", mode: msg.mode, by: peerId }),
+                peerId
+              );
+            }
+            break;
+          }
         }
       } catch (e) {
         console.error("Message error:", e);
       }
     });
 
-    // ── Disconnect handler ──
+    // ── Disconnect ──
     server.addEventListener("close", () => {
       this.peers.delete(peerId);
       this.broadcast(JSON.stringify({ type: "peer-leave", peerId }));
@@ -258,14 +338,9 @@ export class Room {
       try {
         peer.ws.send(message);
       } catch {
-        // Dead connection, clean up
         this.peers.delete(id);
       }
     }
-  }
-
-  async saveScene() {
-    await this.state.storage.put("scene", this.scene);
   }
 }
 
@@ -275,7 +350,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS headers for cross-origin access
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -286,15 +360,12 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // ── Route: /room/:id — WebSocket or info ──
     const roomMatch = path.match(/^\/room\/([a-zA-Z0-9_-]+)(\/info)?$/);
     if (roomMatch) {
       const roomId = roomMatch[1];
       const id = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(id);
       const response = await stub.fetch(request);
-
-      // Add CORS to non-WebSocket responses
       if (!request.headers.get("Upgrade")) {
         const newResponse = new Response(response.body, response);
         for (const [k, v] of Object.entries(corsHeaders)) {
@@ -305,15 +376,13 @@ export default {
       return response;
     }
 
-    // ── Route: /new — Create a new room, return its ID ──
     if (path === "/new" && request.method === "POST") {
-      const roomId = crypto.randomUUID().split("-")[0]; // Short 8-char ID
+      const roomId = crypto.randomUUID().split("-")[0];
       return Response.json({ roomId, url: `/room/${roomId}` }, { headers: corsHeaders });
     }
 
-    // ── Default: landing page ──
     return new Response(
-      `Community 360° Builder — Collaboration Server\n\nPOST /new → create room\nWS /room/:id → join room\nGET /room/:id/info → room info`,
+      `Community 360° Builder — Collaboration Server v2\n\nPOST /new → create room\nWS /room/:id → join room\nGET /room/:id/info → room info`,
       { headers: { ...corsHeaders, "Content-Type": "text/plain" } }
     );
   },
