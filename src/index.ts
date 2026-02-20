@@ -221,44 +221,54 @@ export class Room {
           // Cloudflare's 1MB WebSocket message limit. Server buffers here,
           // then broadcasts the assembled add-item once all chunks arrive.
           case "media-chunk-start": {
-            this.chunkBuffers.set(msg.uploadId, {
-              meta: msg.itemMeta as SceneItem,
-              chunks: [],
-              peerId,
-            });
+            // Assign server ID immediately, persist metadata without src.
+            // Large base64 blobs can't be stored (128KB DO storage limit) —
+            // we relay chunks directly to peers instead.
+            const meta = { ...(msg.itemMeta as SceneItem), src: "" };
+            meta.id = this.scene.nextId++;
+            this.scene.items.push(meta);
+            await this.saveScene();
+            this.chunkBuffers.set(msg.uploadId, { meta, chunks: [], peerId });
+
+            // Tell sender their canonical server ID so client can remap
+            server.send(JSON.stringify({
+              type: "chunk-start-ack",
+              uploadId: msg.uploadId,
+              serverId: meta.id,
+            }));
             break;
           }
 
           case "media-chunk": {
-            const buf = this.chunkBuffers.get(msg.uploadId);
-            if (buf) buf.chunks[msg.index] = msg.data as string;
+            // Relay each chunk immediately — don't buffer on server.
+            // Each chunk is already ≤256KB so outbound relay is safe.
+            this.broadcast(
+              JSON.stringify({ type: "media-chunk", uploadId: msg.uploadId,
+                               index: msg.index, data: msg.data }),
+              peerId
+            );
             break;
           }
 
           case "media-chunk-end": {
             const buf = this.chunkBuffers.get(msg.uploadId);
-            if (!buf) break;
             this.chunkBuffers.delete(msg.uploadId);
 
-            // Verify we have all chunks (no gaps)
-            const expectedChunks = msg.totalChunks as number;
-            if (buf.chunks.length !== expectedChunks || buf.chunks.some(c => c === undefined)) {
-              console.error("Chunked upload incomplete:", msg.uploadId,
-                "got", buf.chunks.filter(Boolean).length, "of", expectedChunks);
-              // Don't broadcast — client will notice item didn't arrive via sync
-              break;
-            }
+            // Relay end signal — peers finalize the item on their side
+            this.broadcast(
+              JSON.stringify({ type: "media-chunk-end", uploadId: msg.uploadId,
+                               totalChunks: msg.totalChunks,
+                               serverId: buf ? buf.meta.id : null,
+                               by: peerId }),
+              peerId
+            );
 
-            // Assemble and store
-            const fullSrc = buf.chunks.join("");
-            const item = buf.meta;
-            item.src = fullSrc;
-            item.id = this.scene.nextId++;
-            this.scene.items.push(item);
-            await this.saveScene();
-
-            // Broadcast to all peers (including sender — they need the server ID)
-            this.broadcast(JSON.stringify({ type: "add-item", item, by: buf.peerId }));
+            // Confirm to sender
+            server.send(JSON.stringify({
+              type: "chunk-complete",
+              uploadId: msg.uploadId,
+              serverId: buf ? buf.meta.id : null,
+            }));
             break;
           }
 
@@ -360,7 +370,19 @@ export class Room {
   }
 
   async saveScene() {
-    await this.state.storage.put("scene", this.scene);
+    // Cloudflare DO storage has a 128KB per-value limit.
+    // Strip large base64 src fields before persisting — blob media is
+    // re-uploaded by clients on reconnect via the chunk protocol.
+    // URL-based src (https://...) is fine and preserved.
+    const sceneToSave: RoomState = {
+      ...this.scene,
+      items: this.scene.items.map(item => {
+        const src = item.src || "";
+        const isLargeBlobSrc = src.startsWith("data:") && src.length > 1024;
+        return isLargeBlobSrc ? { ...item, src: "" } : item;
+      }),
+    };
+    await this.state.storage.put("scene", sceneToSave);
   }
 }
 
