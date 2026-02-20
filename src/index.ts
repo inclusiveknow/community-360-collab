@@ -216,9 +216,10 @@ export class Room {
             this.scene.items.push(item);
             await this.saveScene(); // structural — save immediately
 
-            // Broadcast to everyone including sender so all peers
-            // confirm the same final ID
-            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }));
+            // Broadcast to everyone EXCEPT sender — sender already has
+            // the item locally. Echoing back causes collabSuppressSync
+            // to toggle on the sender, breaking all subsequent sends.
+            this.broadcast(JSON.stringify({ type: "add-item", item, by: peerId }), peerId);
             break;
           }
 
